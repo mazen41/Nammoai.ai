@@ -18,13 +18,24 @@ class UnifiedIntegrationController extends Controller
     {
         $user = Auth::user();
 
-        // 1. Get all connected accounts from connected_accounts table
+        // 1. Get all connected accounts with active connection
         $connectedAccounts = ConnectedAccount::query()
             ->where('user_id', $user->id)
+            ->where('connection_status', 'connected')
             ->orderBy('platform')
             ->orderByDesc('connected_at')
             ->get()
             ->groupBy('platform');
+
+        // Merge any accounts from 'facebook' into 'messenger' so Facebook & Messenger are unified
+        if ($connectedAccounts->has('facebook')) {
+            $fbAccounts = $connectedAccounts->get('facebook');
+            if ($connectedAccounts->has('messenger')) {
+                $connectedAccounts->put('messenger', $connectedAccounts->get('messenger')->merge($fbAccounts));
+            } else {
+                $connectedAccounts->put('messenger', $fbAccounts);
+            }
+        }
 
         // 2. Also check SocialMediaPlatform table for connected social accounts and merge if not present in connected_accounts
         if (class_exists(\App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::class)) {
@@ -34,12 +45,17 @@ class UnifiedIntegrationController extends Controller
 
             foreach ($socialPlatforms as $sp) {
                 $platformKey = (string) $sp->platform;
-                $creds = $sp->credentials ?? [];
+                if ($platformKey === 'facebook') {
+                    $platformKey = 'messenger';
+                }
 
+                $creds = $sp->credentials ?? [];
                 $name = $creds['name'] ?? $creds['username'] ?? ($sp->username() !== 'John Doe' ? $sp->username() : '');
                 $username = $creds['username'] ?? '';
                 $avatar = $creds['picture'] ?? $creds['avatar'] ?? null;
                 $platformId = $creds['platform_id'] ?? (string) $sp->id;
+                $isExpired = $sp->expires_at && $sp->expires_at->lt(now());
+                $status = ($sp->isConnected() && ! $isExpired) ? 'connected' : 'expired';
 
                 if (! $connectedAccounts->has($platformKey) || $connectedAccounts->get($platformKey)->isEmpty()) {
                     $virtualAccount = new ConnectedAccount();
@@ -50,7 +66,7 @@ class UnifiedIntegrationController extends Controller
                         'account_name'       => $name ?: ucfirst($platformKey) . ' Account',
                         'account_username'   => $username,
                         'account_avatar'     => $avatar,
-                        'connection_status'  => $sp->isConnected() ? 'connected' : 'disconnected',
+                        'connection_status'  => $status,
                         'connected_at'       => $sp->connected_at,
                     ]);
                     $virtualAccount->id = $sp->id;
@@ -62,7 +78,6 @@ class UnifiedIntegrationController extends Controller
                         $connectedAccounts->get($platformKey)->push($virtualAccount);
                     }
                 } else {
-                    // Update account_name/avatar on existing connected_account if missing
                     foreach ($connectedAccounts->get($platformKey) as $ca) {
                         if (empty($ca->account_name) && ! empty($name)) {
                             $ca->account_name = $name;
@@ -119,14 +134,22 @@ class UnifiedIntegrationController extends Controller
 
             foreach ($sallaConnections as $sallaConn) {
                 if (! $connectedAccounts->has('salla') || $connectedAccounts->get('salla')->isEmpty()) {
+                    $storeName = $sallaConn->store_name
+                        ?: data_get($sallaConn->store_data, 'data.merchant.name')
+                        ?: 'متجر سلة التجريبي';
+                    $storeDomain = $sallaConn->store_domain
+                        ?: data_get($sallaConn->store_data, 'data.merchant.domain')
+                        ?: 'salla.sa';
+                    $storeAvatar = data_get($sallaConn->store_data, 'data.merchant.avatar');
+
                     $sallaAccount = new ConnectedAccount();
                     $sallaAccount->forceFill([
                         'user_id'            => $sallaConn->user_id,
                         'platform'           => 'salla',
                         'account_identifier' => (string) ($sallaConn->salla_store_id ?? $sallaConn->id),
-                        'account_name'       => $sallaConn->store_name ?: 'Salla Store',
-                        'account_username'   => $sallaConn->store_domain,
-                        'account_avatar'     => null,
+                        'account_name'       => $storeName,
+                        'account_username'   => $storeDomain,
+                        'account_avatar'     => $storeAvatar,
                         'connection_status'  => 'connected',
                         'connected_at'       => $sallaConn->connected_at ?? $sallaConn->created_at,
                     ]);
@@ -147,9 +170,18 @@ class UnifiedIntegrationController extends Controller
         // Define supported platforms and their OAuth / connect routes
         $platforms = $this->getSupportedPlatforms();
 
+        $totalConnected = 0;
+        foreach ($platforms as $pk => $p) {
+            $accs = $connectedAccounts->get($pk, collect());
+            if ($accs->isNotEmpty() && $accs->contains(fn ($a) => $a->isConnected())) {
+                $totalConnected++;
+            }
+        }
+
         return view('panel.user.integrations.index', [
             'connectedAccounts' => $connectedAccounts,
             'platforms'         => $platforms,
+            'totalConnected'    => $totalConnected,
         ]);
     }
 
@@ -267,72 +299,11 @@ class UnifiedIntegrationController extends Controller
         $hasSocialMedia = \App\Helpers\Classes\MarketplaceHelper::isRegistered('social-media');
 
         return [
-            'facebook' => [
-                'name'         => 'Facebook',
-                'icon'         => 'facebook.svg',
-                'connect_route' => 'social-media.oauth.connect.facebook',
-                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.facebook') ? route('social-media.oauth.connect.facebook') : '#',
-                'oauth'        => true,
-                'enabled'      => true,
-                'description'  => 'Connect your Facebook pages and profiles for social posting and engagement.',
-            ],
-            'instagram' => [
-                'name'         => 'Instagram',
-                'icon'         => 'instagram.svg',
-                'connect_route' => 'social-media.oauth.connect.instagram',
-                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.instagram') ? route('social-media.oauth.connect.instagram') : '#',
-                'oauth'        => true,
-                'enabled'      => true,
-                'description'  => 'Connect Instagram business or creator account to publish posts and view analytics.',
-            ],
-            'x' => [
-                'name'         => 'X (Twitter)',
-                'icon'         => 'x.svg',
-                'connect_route' => 'social-media.oauth.connect.x',
-                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.x') ? route('social-media.oauth.connect.x') : '#',
-                'oauth'        => true,
-                'enabled'      => true,
-                'description'  => 'Connect your X account to schedule tweets, threads, and track post performance.',
-            ],
-            'linkedin' => [
-                'name'         => 'LinkedIn',
-                'icon'         => 'linkedin.svg',
-                'connect_route' => 'social-media.oauth.connect.linkedin',
-                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.linkedin') ? route('social-media.oauth.connect.linkedin') : '#',
-                'oauth'        => true,
-                'enabled'      => true,
-                'description'  => 'Connect your LinkedIn personal profile or company pages to publish updates.',
-            ],
-            'tiktok' => [
-                'name'         => 'TikTok',
-                'icon'         => 'tiktok.svg',
-                'connect_route' => 'social-media.oauth.connect.tiktok',
-                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.tiktok') ? route('social-media.oauth.connect.tiktok') : '#',
-                'oauth'        => true,
-                'enabled'      => true,
-                'description'  => 'Connect your TikTok account to publish videos, shorts, and analyze audience growth.',
-            ],
-            'youtube' => [
-                'name'         => 'YouTube',
-                'icon'         => 'youtube.svg',
-                'connect_route' => 'social-media.oauth.connect.youtube',
-                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.youtube') ? route('social-media.oauth.connect.youtube') : '#',
-                'oauth'        => true,
-                'enabled'      => true,
-                'description'  => 'Connect YouTube channel to manage video uploads, titles, and channel stats.',
-            ],
-            'youtube_shorts' => [
-                'name'         => 'YouTube Shorts',
-                'icon'         => 'youtube-shorts.svg',
-                'connect_route' => 'social-media.oauth.connect.youtube-shorts',
-                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.youtube-shorts') ? route('social-media.oauth.connect.youtube-shorts') : '#',
-                'oauth'        => true,
-                'enabled'      => true,
-                'description'  => 'Connect YouTube Shorts for quick short-form video publishing.',
-            ],
             'whatsapp_cloud' => [
                 'name'         => 'WhatsApp Business',
-                'icon'         => 'whatsapp.svg',
+                'badge'        => 'Meta Cloud API',
+                'category'     => 'messaging',
+                'icon'         => 'whatsapp',
                 'connect_route' => 'dashboard.user.integrations.whatsapp-cloud.connect',
                 'connect_url'  => \Route::has('dashboard.user.integrations.whatsapp-cloud.connect') ? route('dashboard.user.integrations.whatsapp-cloud.connect') : '#',
                 'oauth'        => true,
@@ -340,26 +311,32 @@ class UnifiedIntegrationController extends Controller
                 'description'  => 'Connect official WhatsApp Business Cloud API in 1-click for AI customer support and automated messaging.',
             ],
             'messenger' => [
-                'name'         => 'Facebook Messenger',
-                'icon'         => 'facebook-messenger.svg',
+                'name'         => 'Facebook & Messenger',
+                'badge'        => 'Pages & AI Reply',
+                'category'     => 'messaging',
+                'icon'         => 'facebook-messenger',
                 'connect_route' => 'dashboard.user.integrations.messenger.connect',
                 'connect_url'  => \Route::has('dashboard.user.integrations.messenger.connect') ? route('dashboard.user.integrations.messenger.connect') : '#',
                 'oauth'        => true,
                 'enabled'      => true,
-                'description'  => 'Connect your Facebook Pages to automate Messenger replies, post comments, and 24/7 AI customer care.',
+                'description'  => 'Connect Facebook Pages to automate Messenger replies, post comments, and 24/7 AI customer care.',
             ],
-            'woocommerce' => [
-                'name'         => 'WooCommerce',
-                'icon'         => 'woocommerce.svg',
-                'connect_route' => 'dashboard.user.integration.index',
-                'connect_url'  => \Route::has('dashboard.user.integration.index') ? route('dashboard.user.integration.index') : '#',
-                'oauth'        => false,
+            'instagram' => [
+                'name'         => 'Instagram Direct & Comments',
+                'badge'        => 'DMs & Reels',
+                'category'     => 'messaging',
+                'icon'         => 'instagram',
+                'connect_route' => 'dashboard.user.integrations.instagram.connect',
+                'connect_url'  => \Route::has('dashboard.user.integrations.instagram.connect') ? route('dashboard.user.integrations.instagram.connect') : '#',
+                'oauth'        => true,
                 'enabled'      => true,
-                'description'  => 'Integrate your WooCommerce store for automated product queries, orders, and AI shopping.',
+                'description'  => 'Connect Instagram Business accounts to automate direct messages and reply to post & reel comments.',
             ],
             'salla' => [
                 'name'         => 'Salla (سلة)',
-                'icon'         => 'salla.svg',
+                'badge'        => 'E-Commerce',
+                'category'     => 'stores',
+                'icon'         => 'salla',
                 'connect_route' => 'dashboard.user.salla.connect',
                 'connect_url'  => \Route::has('dashboard.user.salla.connect') ? route('dashboard.user.salla.connect') : '#',
                 'oauth'        => true,
@@ -368,12 +345,69 @@ class UnifiedIntegrationController extends Controller
             ],
             'shopify' => [
                 'name'         => 'Shopify',
-                'icon'         => 'shopify.svg',
+                'badge'        => 'E-Commerce',
+                'category'     => 'stores',
+                'icon'         => 'shopify',
                 'connect_route' => 'dashboard.user.chatbots.index',
                 'connect_url'  => \Route::has('dashboard.user.chatbots.index') ? route('dashboard.user.chatbots.index') : '#',
                 'oauth'        => false,
                 'enabled'      => true,
                 'description'  => 'Connect your Shopify store via Storefront/Admin API to enable product search, prices, and cart checkout.',
+            ],
+            'woocommerce' => [
+                'name'         => 'WooCommerce',
+                'badge'        => 'E-Commerce',
+                'category'     => 'stores',
+                'icon'         => 'woocommerce',
+                'connect_route' => 'dashboard.user.integration.index',
+                'connect_url'  => \Route::has('dashboard.user.integration.index') ? route('dashboard.user.integration.index') : '#',
+                'oauth'        => false,
+                'enabled'      => true,
+                'description'  => 'Integrate your WooCommerce store via REST API for automated product queries, orders, and AI shopping.',
+            ],
+            'tiktok' => [
+                'name'         => 'TikTok',
+                'badge'        => 'Social Media',
+                'category'     => 'social',
+                'icon'         => 'tiktok',
+                'connect_route' => 'social-media.oauth.connect.tiktok',
+                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.tiktok') ? route('social-media.oauth.connect.tiktok') : '#',
+                'oauth'        => true,
+                'enabled'      => true,
+                'description'  => 'Connect your TikTok account to publish videos, shorts, and analyze audience growth.',
+            ],
+            'youtube' => [
+                'name'         => 'YouTube & Shorts',
+                'badge'        => 'Social Media',
+                'category'     => 'social',
+                'icon'         => 'youtube',
+                'connect_route' => 'social-media.oauth.connect.youtube',
+                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.youtube') ? route('social-media.oauth.connect.youtube') : '#',
+                'oauth'        => true,
+                'enabled'      => true,
+                'description'  => 'Connect YouTube channel to manage video uploads, shorts, titles, and channel performance.',
+            ],
+            'x' => [
+                'name'         => 'X (Twitter)',
+                'badge'        => 'Social Media',
+                'category'     => 'social',
+                'icon'         => 'x',
+                'connect_route' => 'social-media.oauth.connect.x',
+                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.x') ? route('social-media.oauth.connect.x') : '#',
+                'oauth'        => true,
+                'enabled'      => true,
+                'description'  => 'Connect your X account to schedule tweets, threads, and track post performance.',
+            ],
+            'linkedin' => [
+                'name'         => 'LinkedIn',
+                'badge'        => 'Social Media',
+                'category'     => 'social',
+                'icon'         => 'linkedin',
+                'connect_route' => 'social-media.oauth.connect.linkedin',
+                'connect_url'  => $hasSocialMedia && \Route::has('social-media.oauth.connect.linkedin') ? route('social-media.oauth.connect.linkedin') : '#',
+                'oauth'        => true,
+                'enabled'      => true,
+                'description'  => 'Connect your LinkedIn personal profile or company pages to publish updates and articles.',
             ],
         ];
     }

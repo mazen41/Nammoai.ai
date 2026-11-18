@@ -2747,7 +2747,7 @@ class MenuService
                 'active_condition' => [
                     'dashboard.user.salla.*',
                 ],
-                'show_condition' => true,
+                'show_condition' => false, // Handled inside Integrations Hub
             ],
             'divider_one' => [
                 'parent_key'       => null,
@@ -4923,7 +4923,7 @@ class MenuService
                 'active_condition' => [
                     'dashboard.user.automation.index',
                 ],
-                'show_condition' => Route::has('dashboard.user.automation.index') && $is_automation_active,
+                'show_condition' => false, // Hidden to prevent duplicate menu item
             ],
             'scheduled_posts_extension' => [
                 'parent_key'       => null,
@@ -4940,7 +4940,7 @@ class MenuService
                 'active_condition' => [
                     'dashboard.user.automation.list',
                 ],
-                'show_condition' => Route::has('dashboard.user.automation.list') && $is_automation_active,
+                'show_condition' => false, // Hidden to prevent duplicate menu item
             ],
             'ai_social_media_settings_extension' => [
                 'parent_key'       => 'settings',
