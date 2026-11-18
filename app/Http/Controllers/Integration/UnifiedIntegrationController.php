@@ -42,8 +42,8 @@ class UnifiedIntegrationController extends Controller
                 $platformId = $creds['platform_id'] ?? (string) $sp->id;
 
                 if (! $connectedAccounts->has($platformKey) || $connectedAccounts->get($platformKey)->isEmpty()) {
-                    $virtualAccount = new ConnectedAccount([
-                        'id'                 => $sp->id,
+                    $virtualAccount = new ConnectedAccount();
+                    $virtualAccount->forceFill([
                         'user_id'            => $sp->user_id,
                         'platform'           => $platformKey,
                         'account_identifier' => $platformId,
@@ -53,6 +53,8 @@ class UnifiedIntegrationController extends Controller
                         'connection_status'  => $sp->isConnected() ? 'connected' : 'disconnected',
                         'connected_at'       => $sp->connected_at,
                     ]);
+                    $virtualAccount->id = $sp->id;
+                    $virtualAccount->disconnect_url = route('dashboard.user.integrations.disconnect', $sp->id);
 
                     if (! $connectedAccounts->has($platformKey)) {
                         $connectedAccounts->put($platformKey, collect([$virtualAccount]));
@@ -91,8 +93,8 @@ class UnifiedIntegrationController extends Controller
                     ?: data_get($userWoo->credentials, 'site_url')
                     ?: 'WooCommerce Store';
 
-                $wooAccount = new ConnectedAccount([
-                    'id'                 => $userWoo->id,
+                $wooAccount = new ConnectedAccount();
+                $wooAccount->forceFill([
                     'user_id'            => $user->id,
                     'platform'           => 'woocommerce',
                     'account_identifier' => (string) $userWoo->id,
@@ -102,6 +104,7 @@ class UnifiedIntegrationController extends Controller
                     'connection_status'  => 'connected',
                     'connected_at'       => $userWoo->updated_at ?? now(),
                 ]);
+                $wooAccount->id = $userWoo->id;
 
                 $connectedAccounts->put('woocommerce', collect([$wooAccount]));
             }
@@ -116,8 +119,8 @@ class UnifiedIntegrationController extends Controller
 
             foreach ($sallaConnections as $sallaConn) {
                 if (! $connectedAccounts->has('salla') || $connectedAccounts->get('salla')->isEmpty()) {
-                    $sallaAccount = new ConnectedAccount([
-                        'id'                 => $sallaConn->id,
+                    $sallaAccount = new ConnectedAccount();
+                    $sallaAccount->forceFill([
                         'user_id'            => $sallaConn->user_id,
                         'platform'           => 'salla',
                         'account_identifier' => (string) ($sallaConn->salla_store_id ?? $sallaConn->id),
@@ -127,6 +130,10 @@ class UnifiedIntegrationController extends Controller
                         'connection_status'  => 'connected',
                         'connected_at'       => $sallaConn->connected_at ?? $sallaConn->created_at,
                     ]);
+                    $sallaAccount->id = $sallaConn->id;
+                    $sallaAccount->disconnect_url = \Route::has('dashboard.user.salla.disconnect')
+                        ? route('dashboard.user.salla.disconnect', $sallaConn->id)
+                        : null;
 
                     if (! $connectedAccounts->has('salla')) {
                         $connectedAccounts->put('salla', collect([$sallaAccount]));
@@ -146,22 +153,50 @@ class UnifiedIntegrationController extends Controller
         ]);
     }
 
-    public function disconnect(Request $request, ConnectedAccount $account)
+    public function disconnect(Request $request, $account)
     {
         $user = Auth::user();
 
+        if ($account instanceof ConnectedAccount) {
+            $connectedAccount = $account;
+        } else {
+            $connectedAccount = ConnectedAccount::where('user_id', $user->id)->find($account);
+        }
+
+        if (! $connectedAccount) {
+            // Check SocialMediaPlatform
+            if (class_exists(\App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::class)) {
+                $sp = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::query()
+                    ->where('user_id', $user->id)
+                    ->where('id', $account)
+                    ->first();
+                if ($sp) {
+                    $sp->delete();
+                    return back()->with([
+                        'type'    => 'success',
+                        'message' => trans('Account disconnected successfully.'),
+                    ]);
+                }
+            }
+
+            return back()->with([
+                'type'    => 'error',
+                'message' => trans('Account not found or already disconnected.'),
+            ]);
+        }
+
         \Log::info('[CONNECTED ACCOUNT] Disconnect request received', [
-            'account_id' => $account->id,
-            'platform' => $account->platform,
-            'account_identifier' => $account->account_identifier,
+            'account_id' => $connectedAccount->id,
+            'platform' => $connectedAccount->platform,
+            'account_identifier' => $connectedAccount->account_identifier,
             'user_id' => $user->id,
-            'account_user_id' => $account->user_id,
+            'account_user_id' => $connectedAccount->user_id,
         ]);
 
-        if ($account->user_id !== $user->id) {
+        if ($connectedAccount->user_id !== $user->id) {
             \Log::error('[CONNECTED ACCOUNT] Disconnect failed: unauthorized', [
-                'account_id' => $account->id,
-                'account_user_id' => $account->user_id,
+                'account_id' => $connectedAccount->id,
+                'account_user_id' => $connectedAccount->user_id,
                 'current_user_id' => $user->id,
             ]);
             abort(403, 'Unauthorized');
@@ -171,11 +206,11 @@ class UnifiedIntegrationController extends Controller
         if (class_exists(\App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::class)) {
             \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::query()
                 ->where('user_id', $user->id)
-                ->where('platform', $account->platform)
+                ->where('platform', $connectedAccount->platform)
                 ->delete();
         }
 
-        $result = $this->accountService->disconnect($account, $user);
+        $result = $this->accountService->disconnect($connectedAccount, $user);
 
         return back()->with([
             'type'    => 'success',

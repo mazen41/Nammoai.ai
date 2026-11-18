@@ -83,19 +83,25 @@
                                             </div>
                                         </div>
                                         <div class="flex items-center gap-2">
-                                            <form method="POST" action="{{ route('dashboard.user.integrations.disconnect', $account->id) }}">
-                                                @csrf
-                                                @method('DELETE')
-                                                <x-button
-                                                    type="submit"
-                                                    size="xs"
-                                                    variant="outline"
-                                                    class="text-red-600 border-red-200 hover:bg-red-50"
-                                                    onclick="return confirm('{{ __('Disconnect this account?') }}')"
-                                                >
-                                                    @lang('Disconnect')
-                                                </x-button>
-                                            </form>
+                                            @php
+                                                $disconnectUrl = $account->disconnect_url
+                                                    ?? (!empty($account->id) ? route('dashboard.user.integrations.disconnect', $account->id) : null);
+                                            @endphp
+                                            @if ($disconnectUrl)
+                                                <form method="POST" action="{{ $disconnectUrl }}">
+                                                    @csrf
+                                                    @method('DELETE')
+                                                    <x-button
+                                                        type="submit"
+                                                        size="xs"
+                                                        variant="outline"
+                                                        class="text-red-600 border-red-200 hover:bg-red-50"
+                                                        onclick="return confirm('{{ __('Disconnect this account?') }}')"
+                                                    >
+                                                        @lang('Disconnect')
+                                                    </x-button>
+                                                </form>
+                                            @endif
                                         </div>
                                     </div>
                                 @endforeach
