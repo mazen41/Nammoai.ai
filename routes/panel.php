@@ -159,7 +159,7 @@ Route::middleware(['auth', 'updateUserActivity'])
                     Route::get('/', [\App\Http\Controllers\Integration\UnifiedIntegrationController::class, 'index'])
                         ->name('index');
 
-                    Route::delete('/{account}/disconnect', [\App\Http\Controllers\Integration\UnifiedIntegrationController::class, 'disconnect'])
+                    Route::match(['delete', 'post'], '/disconnect/{account?}', [\App\Http\Controllers\Integration\UnifiedIntegrationController::class, 'disconnect'])
                         ->name('disconnect');
 
                     Route::get('/api/accounts', [\App\Http\Controllers\Integration\UnifiedIntegrationController::class, 'apiList'])

@@ -127,43 +127,42 @@ class UnifiedIntegrationController extends Controller
 
         // 4. Check Salla integration status
         if (class_exists(\App\Models\SallaConnection::class)) {
+            // Clear any zombie/incomplete salla rows from connectedAccounts
+            $connectedAccounts->forget('salla');
+
             $sallaConnections = \App\Models\SallaConnection::query()
                 ->where('user_id', $user->id)
                 ->where('connection_status', 'connected')
                 ->get();
 
+            $sallaAccounts = collect();
             foreach ($sallaConnections as $sallaConn) {
-                if (! $connectedAccounts->has('salla') || $connectedAccounts->get('salla')->isEmpty()) {
-                    $storeName = $sallaConn->store_name
-                        ?: data_get($sallaConn->store_data, 'data.merchant.name')
-                        ?: 'متجر سلة التجريبي';
-                    $storeDomain = $sallaConn->store_domain
-                        ?: data_get($sallaConn->store_data, 'data.merchant.domain')
-                        ?: 'salla.sa';
-                    $storeAvatar = data_get($sallaConn->store_data, 'data.merchant.avatar');
+                $storeName = $sallaConn->store_name
+                    ?: data_get($sallaConn->store_data, 'data.merchant.name')
+                    ?: 'متجر سلة التجريبي';
+                $storeDomain = $sallaConn->store_domain
+                    ?: data_get($sallaConn->store_data, 'data.merchant.domain')
+                    ?: 'salla.sa';
+                $storeAvatar = data_get($sallaConn->store_data, 'data.merchant.avatar');
 
-                    $sallaAccount = new ConnectedAccount();
-                    $sallaAccount->forceFill([
-                        'user_id'            => $sallaConn->user_id,
-                        'platform'           => 'salla',
-                        'account_identifier' => (string) ($sallaConn->salla_store_id ?? $sallaConn->id),
-                        'account_name'       => $storeName,
-                        'account_username'   => $storeDomain,
-                        'account_avatar'     => $storeAvatar,
-                        'connection_status'  => 'connected',
-                        'connected_at'       => $sallaConn->connected_at ?? $sallaConn->created_at,
-                    ]);
-                    $sallaAccount->id = $sallaConn->id;
-                    $sallaAccount->disconnect_url = \Route::has('dashboard.user.salla.disconnect')
-                        ? route('dashboard.user.salla.disconnect', $sallaConn->id)
-                        : null;
+                $sallaAccount = new ConnectedAccount();
+                $sallaAccount->forceFill([
+                    'user_id'            => $sallaConn->user_id,
+                    'platform'           => 'salla',
+                    'account_identifier' => (string) ($sallaConn->salla_store_id ?? $sallaConn->id),
+                    'account_name'       => $storeName,
+                    'account_username'   => $storeDomain,
+                    'account_avatar'     => $storeAvatar,
+                    'connection_status'  => 'connected',
+                    'connected_at'       => $sallaConn->connected_at ?? $sallaConn->created_at,
+                ]);
+                $sallaAccount->id = $sallaConn->id;
+                $sallaAccount->source = 'salla';
+                $sallaAccounts->push($sallaAccount);
+            }
 
-                    if (! $connectedAccounts->has('salla')) {
-                        $connectedAccounts->put('salla', collect([$sallaAccount]));
-                    } else {
-                        $connectedAccounts->get('salla')->push($sallaAccount);
-                    }
-                }
+            if ($sallaAccounts->isNotEmpty()) {
+                $connectedAccounts->put('salla', $sallaAccounts);
             }
         }
 
@@ -185,64 +184,101 @@ class UnifiedIntegrationController extends Controller
         ]);
     }
 
-    public function disconnect(Request $request, $account)
+    public function disconnect(Request $request, $account = null)
     {
         $user = Auth::user();
+        $platform = $request->input('platform');
+        $id = $account ?: $request->input('account_id') ?: $request->input('id');
 
-        if ($account instanceof ConnectedAccount) {
-            $connectedAccount = $account;
-        } else {
-            $connectedAccount = ConnectedAccount::where('user_id', $user->id)->find($account);
-        }
-
-        if (! $connectedAccount) {
-            // Check SocialMediaPlatform
-            if (class_exists(\App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::class)) {
-                $sp = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::query()
-                    ->where('user_id', $user->id)
-                    ->where('id', $account)
-                    ->first();
-                if ($sp) {
-                    $sp->delete();
-                    return back()->with([
-                        'type'    => 'success',
-                        'message' => trans('Account disconnected successfully.'),
-                    ]);
-                }
-            }
-
-            return back()->with([
-                'type'    => 'error',
-                'message' => trans('Account not found or already disconnected.'),
-            ]);
-        }
-
-        \Log::info('[CONNECTED ACCOUNT] Disconnect request received', [
-            'account_id' => $connectedAccount->id,
-            'platform' => $connectedAccount->platform,
-            'account_identifier' => $connectedAccount->account_identifier,
+        \Log::info('[DISCONNECT] Request received', [
+            'id' => $id,
+            'platform' => $platform,
             'user_id' => $user->id,
-            'account_user_id' => $connectedAccount->user_id,
+            'inputs' => $request->all(),
         ]);
 
-        if ($connectedAccount->user_id !== $user->id) {
-            \Log::error('[CONNECTED ACCOUNT] Disconnect failed: unauthorized', [
-                'account_id' => $connectedAccount->id,
-                'account_user_id' => $connectedAccount->user_id,
-                'current_user_id' => $user->id,
+        // 1. If platform is Salla OR id is a Salla connection
+        if ($platform === 'salla' || (class_exists(\App\Models\SallaConnection::class) && \App\Models\SallaConnection::where('user_id', $user->id)->where('id', $id)->exists())) {
+            if (class_exists(\App\Models\SallaConnection::class)) {
+                $sallaQ = \App\Models\SallaConnection::where('user_id', $user->id);
+                if ($id) {
+                    $sallaQ->where(function ($q) use ($id) {
+                        $q->where('id', $id)->orWhere('salla_store_id', $id);
+                    });
+                }
+                $sallaQ->update([
+                    'connection_status' => 'disconnected',
+                    'webhook_status' => 'inactive',
+                    'access_token' => null,
+                    'refresh_token' => null,
+                ]);
+            }
+            ConnectedAccount::where('user_id', $user->id)->where('platform', 'salla')->update([
+                'connection_status' => 'disconnected',
+                'access_token' => null,
+                'refresh_token' => null,
             ]);
-            abort(403, 'Unauthorized');
+
+            return back()->with([
+                'type' => 'success',
+                'message' => trans('Salla store disconnected successfully.'),
+            ]);
         }
 
-        // Handle disconnect in SocialMediaPlatform table if exists
+        // 2. If it's WooCommerce
+        if ($platform === 'woocommerce') {
+            $wooIntegration = \App\Models\Integration\Integration::query()->whereIn('slug', ['woocommerce', 'wordpress'])->first();
+            if ($wooIntegration) {
+                \App\Models\Integration\UserIntegration::where('user_id', $user->id)
+                    ->where('integration_id', $wooIntegration->id)
+                    ->delete();
+            }
+            ConnectedAccount::where('user_id', $user->id)->where('platform', 'woocommerce')->delete();
+            return back()->with([
+                'type' => 'success',
+                'message' => trans('WooCommerce disconnected successfully.'),
+            ]);
+        }
+
+        // 3. Check ext_social_media_platforms (Instagram, TikTok, X, YouTube, LinkedIn)
+        $deletedFromSocial = false;
         if (class_exists(\App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::class)) {
-            \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::query()
-                ->where('user_id', $user->id)
-                ->where('platform', $connectedAccount->platform)
-                ->delete();
+            $sp = null;
+            if ($id) {
+                $sp = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::where('user_id', $user->id)->find($id);
+            }
+            if (! $sp && $platform) {
+                $sp = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::where('user_id', $user->id)->where('platform', $platform)->first();
+            }
+            if ($sp) {
+                $deletedPlatform = (string) $sp->platform;
+                $sp->delete();
+                $deletedFromSocial = true;
+
+                // Also update connected_accounts if present
+                ConnectedAccount::where('user_id', $user->id)->where('platform', $deletedPlatform)->update([
+                    'connection_status' => 'disconnected',
+                    'access_token' => null,
+                    'refresh_token' => null,
+                ]);
+            }
         }
 
-        $result = $this->accountService->disconnect($connectedAccount, $user);
+        // 4. Check connected_accounts
+        $ca = null;
+        if ($id) {
+            $ca = ConnectedAccount::where('user_id', $user->id)->find($id);
+        }
+        if (! $ca && $platform) {
+            $ca = ConnectedAccount::where('user_id', $user->id)->where('platform', $platform)->first();
+        }
+
+        if ($ca) {
+            if ($ca->user_id !== $user->id) {
+                abort(403, 'Unauthorized');
+            }
+            $this->accountService->disconnect($ca, $user);
+        }
 
         return back()->with([
             'type'    => 'success',
