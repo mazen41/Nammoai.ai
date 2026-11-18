@@ -7,6 +7,8 @@ use App\Models\ConnectedAccount;
 use App\Services\OAuth\ConnectedAccountService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class UnifiedIntegrationController extends Controller
 {
@@ -245,7 +247,8 @@ class UnifiedIntegrationController extends Controller
         if (class_exists(\App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::class)) {
             $sp = null;
             if ($id) {
-                $sp = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::where('user_id', $user->id)->find($id);
+                // Use where('id', $id) instead of find($id) to avoid query builder conflicts
+                $sp = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::where('user_id', $user->id)->where('id', $id)->first();
             }
             if (! $sp && $platform) {
                 $sp = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::where('user_id', $user->id)->where('platform', $platform)->first();
@@ -255,19 +258,47 @@ class UnifiedIntegrationController extends Controller
                 $sp->delete();
                 $deletedFromSocial = true;
 
+                \Log::info('[DISCONNECT] Deleted from ext_social_media_platforms', ['id' => $sp->id, 'platform' => $deletedPlatform]);
+
                 // Also update connected_accounts if present
                 ConnectedAccount::where('user_id', $user->id)->where('platform', $deletedPlatform)->update([
                     'connection_status' => 'disconnected',
                     'access_token' => null,
                     'refresh_token' => null,
                 ]);
+            } else {
+                // Fallback: direct DB delete if Eloquent model lookup fails
+                $directDeleted = \DB::table('ext_social_media_platforms')
+                    ->where('user_id', $user->id)
+                    ->where(function ($q) use ($id, $platform) {
+                        if ($id) {
+                            $q->where('id', $id);
+                        }
+                        if ($platform) {
+                            $q->orWhere('platform', $platform);
+                        }
+                    })
+                    ->delete();
+
+                if ($directDeleted > 0) {
+                    $deletedFromSocial = true;
+                    \Log::info('[DISCONNECT] Fallback DB delete from ext_social_media_platforms', ['id' => $id, 'platform' => $platform, 'rows' => $directDeleted]);
+
+                    if ($platform) {
+                        ConnectedAccount::where('user_id', $user->id)->where('platform', $platform)->update([
+                            'connection_status' => 'disconnected',
+                            'access_token' => null,
+                            'refresh_token' => null,
+                        ]);
+                    }
+                }
             }
         }
 
         // 4. Check connected_accounts
         $ca = null;
         if ($id) {
-            $ca = ConnectedAccount::where('user_id', $user->id)->find($id);
+            $ca = ConnectedAccount::where('user_id', $user->id)->where('id', $id)->first();
         }
         if (! $ca && $platform) {
             $ca = ConnectedAccount::where('user_id', $user->id)->where('platform', $platform)->first();
@@ -278,6 +309,17 @@ class UnifiedIntegrationController extends Controller
                 abort(403, 'Unauthorized');
             }
             $this->accountService->disconnect($ca, $user);
+        } elseif ($platform && ! $deletedFromSocial) {
+            // Last-resort: direct DB update on connected_accounts
+            $updated = \DB::table('connected_accounts')
+                ->where('user_id', $user->id)
+                ->where('platform', $platform)
+                ->update([
+                    'connection_status' => 'disconnected',
+                    'access_token' => null,
+                    'refresh_token' => null,
+                ]);
+            \Log::info('[DISCONNECT] Fallback DB update on connected_accounts', ['platform' => $platform, 'rows' => $updated]);
         }
 
         return back()->with([
