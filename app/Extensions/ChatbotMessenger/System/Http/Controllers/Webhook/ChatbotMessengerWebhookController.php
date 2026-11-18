@@ -252,10 +252,13 @@ class ChatbotMessengerWebhookController extends Controller
         $token = $request->query('hub_verify_token');
         $challenge = $request->query('hub_challenge');
 
-        $expectedToken = env('MESSENGER_WEBHOOK_VERIFY_TOKEN');
+        $expectedToken = env('MESSENGER_WEBHOOK_VERIFY_TOKEN')
+            ?: setting('MESSENGER_WEBHOOK_VERIFY_TOKEN')
+            ?: setting('MESSENGER_VERIFY_TOKEN')
+            ?: setting('INSTAGRAM_VERIFY_TOKEN');
 
         if (!$expectedToken) {
-            Log::error('Messenger webhook verification failed: MESSENGER_WEBHOOK_VERIFY_TOKEN not configured in .env');
+            Log::error('Messenger webhook verification failed: MESSENGER_WEBHOOK_VERIFY_TOKEN not configured in .env or settings');
             return response('Webhook verification token not configured', 500);
         }
 

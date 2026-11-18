@@ -3,11 +3,13 @@
 namespace App\Http\Controllers\Integration;
 
 use App\Http\Controllers\Controller;
+use App\Models\ConnectedAccount;
 use App\Services\OAuth\ConnectedAccountService;
 use App\Services\OAuth\OAuthStateService;
 use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -18,11 +20,69 @@ class MessengerOAuthController extends Controller
         private ConnectedAccountService $accountService
     ) {}
 
+    protected function getAppId(): ?string
+    {
+        return setting('FACEBOOK_APP_ID')
+            ?: setting('INSTAGRAM_APP_ID')
+            ?: config('services.facebook.client_id')
+            ?: env('FACEBOOK_APP_ID')
+            ?: env('INSTAGRAM_APP_ID');
+    }
+
+    protected function getAppSecret(): ?string
+    {
+        return setting('FACEBOOK_APP_SECRET')
+            ?: setting('INSTAGRAM_APP_SECRET')
+            ?: config('services.facebook.client_secret')
+            ?: env('FACEBOOK_APP_SECRET')
+            ?: env('INSTAGRAM_APP_SECRET');
+    }
+
+    /**
+     * Exchange a short-lived user token for a 60-day long-lived user access token.
+     * When long-lived user tokens query /me/accounts, Facebook returns permanent (never-expiring) page access tokens.
+     */
+    protected function exchangeForLongLivedToken(string $shortToken): string
+    {
+        try {
+            $appId     = $this->getAppId();
+            $appSecret = $this->getAppSecret();
+
+            if (!$appId || !$appSecret) {
+                return $shortToken;
+            }
+
+            $res = Http::asForm()->get('https://graph.facebook.com/v18.0/oauth/access_token', [
+                'grant_type'        => 'fb_exchange_token',
+                'client_id'         => $appId,
+                'client_secret'     => $appSecret,
+                'fb_exchange_token' => $shortToken,
+            ]);
+
+            if ($res->successful()) {
+                $data = $res->json();
+                if (!empty($data['access_token'])) {
+                    Log::info('Messenger OAuth: Successfully exchanged short-lived token for long-lived user token');
+                    return $data['access_token'];
+                }
+            } else {
+                Log::warning('Messenger OAuth: Long-lived token exchange returned non-success, using short token', [
+                    'status' => $res->status(),
+                    'body'   => $res->json(),
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Messenger OAuth: Exception during long-lived token exchange: ' . $e->getMessage());
+        }
+
+        return $shortToken;
+    }
+
     public function redirect()
     {
         $user = Auth::user();
 
-        if (!setting('INSTAGRAM_APP_ID') || !setting('INSTAGRAM_APP_SECRET')) {
+        if (!$this->getAppId() || !$this->getAppSecret()) {
             return back()->with(['type' => 'error', 'message' => trans('Facebook App ID and Secret are not configured.')]);
         }
 
@@ -30,7 +90,7 @@ class MessengerOAuthController extends Controller
 
         $params = [
             'response_type' => 'code',
-            'client_id'     => setting('INSTAGRAM_APP_ID'),
+            'client_id'     => $this->getAppId(),
             'redirect_uri'  => $this->redirectUri(),
             'scope'         => 'pages_messaging,pages_read_engagement,pages_show_list,pages_manage_posts',
             'state'         => $state,
@@ -64,20 +124,24 @@ class MessengerOAuthController extends Controller
         }
 
         try {
-            // Exchange code for short-lived token
+            // Exchange code for user access token
             $tokenRes = Http::asForm()->post('https://graph.facebook.com/v18.0/oauth/access_token', [
-                'client_id'     => setting('INSTAGRAM_APP_ID'),
-                'client_secret' => setting('INSTAGRAM_APP_SECRET'),
+                'client_id'     => $this->getAppId(),
+                'client_secret' => $this->getAppSecret(),
                 'code'          => $code,
                 'redirect_uri'  => $this->redirectUri(),
             ])->throw()->json();
 
             $shortToken = $tokenRes['access_token'];
 
-            // Get pages the user manages
-            $pagesRes = Http::withToken($shortToken)
+            // Exchange for 60-day long-lived token so page tokens returned from /me/accounts never expire
+            $userToken = $this->exchangeForLongLivedToken($shortToken);
+
+            // Get all Facebook Pages the user manages
+            $pagesRes = Http::withToken($userToken)
                 ->get('https://graph.facebook.com/v18.0/me/accounts', [
-                    'fields' => 'id,name,access_token',
+                    'fields' => 'id,name,access_token,category,picture',
+                    'limit'  => 100,
                 ])->throw()->json();
 
             $pages = $pagesRes['data'] ?? [];
@@ -86,8 +150,93 @@ class MessengerOAuthController extends Controller
                 throw new Exception('No Facebook Pages found. You must have at least one Facebook Page to use Messenger.');
             }
 
-            // For simplicity, use the first page. In production, this should show a page selector
-            $page = $pages[0];
+            // Cache candidate pages for selection (15 minutes TTL)
+            $pickToken = bin2hex(random_bytes(24));
+            Cache::put("messenger_pick_{$pickToken}", [
+                'user_id'        => $user->id,
+                'pages'          => $pages,
+                'granted_scopes' => $request->input('granted_scopes', []),
+            ], 900);
+
+            return redirect()->route('dashboard.user.integrations.messenger.select', [
+                'pick_token' => $pickToken,
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Messenger OAuth callback failed', ['user_id' => $user->id, 'error' => $e->getMessage()]);
+
+            return redirect()->route('dashboard.user.integrations.index')
+                ->with(['type' => 'error', 'message' => trans('Failed to connect Facebook Page: ') . $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Show page selection view allowing the user to select which Facebook Page(s) to connect.
+     */
+    public function select(Request $request)
+    {
+        $user      = Auth::user();
+        $pickToken = $request->query('pick_token');
+
+        if (!$pickToken) {
+            return redirect()->route('dashboard.user.integrations.index')
+                ->with(['type' => 'error', 'message' => trans('Invalid selection session.')]);
+        }
+
+        $sessionData = Cache::get("messenger_pick_{$pickToken}");
+        if (!$sessionData || ($sessionData['user_id'] ?? null) !== $user->id) {
+            return redirect()->route('dashboard.user.integrations.index')
+                ->with(['type' => 'error', 'message' => trans('Selection session expired. Please connect again.')]);
+        }
+
+        $pages = $sessionData['pages'] ?? [];
+
+        $alreadyConnectedIds = ConnectedAccount::query()
+            ->where('user_id', $user->id)
+            ->where('platform', 'messenger')
+            ->where('connection_status', 'connected')
+            ->pluck('account_identifier')
+            ->toArray();
+
+        return view('panel.user.integrations.messenger.select', [
+            'pages'               => $pages,
+            'pick_token'          => $pickToken,
+            'alreadyConnectedIds' => $alreadyConnectedIds,
+        ]);
+    }
+
+    /**
+     * Store selected Facebook Page(s) into connected_accounts and subscribe to webhooks.
+     */
+    public function store(Request $request)
+    {
+        $user = Auth::user();
+
+        $request->validate([
+            'pick_token' => 'required|string',
+            'page_ids'   => 'required|array|min:1',
+            'page_ids.*' => 'required|string',
+        ]);
+
+        $pickToken   = $request->input('pick_token');
+        $selectedIds = $request->input('page_ids', []);
+
+        $sessionData = Cache::get("messenger_pick_{$pickToken}");
+        if (!$sessionData || ($sessionData['user_id'] ?? null) !== $user->id) {
+            return redirect()->route('dashboard.user.integrations.index')
+                ->with(['type' => 'error', 'message' => trans('Selection session expired. Please connect again.')]);
+        }
+
+        $pages     = $sessionData['pages'] ?? [];
+        $pagesById = collect($pages)->keyBy('id');
+
+        $connectedCount = 0;
+
+        foreach ($selectedIds as $pageId) {
+            $page = $pagesById->get($pageId);
+            if (!$page || empty($page['access_token'])) {
+                continue;
+            }
 
             // Save to connected_accounts
             $this->accountService->createOrUpdate(
@@ -98,32 +247,17 @@ class MessengerOAuthController extends Controller
                 accountData: [
                     'name'     => $page['name'],
                     'username' => null,
-                    'avatar'   => null,
+                    'avatar'   => data_get($page, 'picture.data.url'),
                     'metadata' => [
-                        'page_id'   => $page['id'],
-                        'page_name' => $page['name'],
-                        'granted_permissions' => $request->input('granted_scopes', []),
+                        'page_id'             => $page['id'],
+                        'page_name'           => $page['name'],
+                        'category'            => $page['category'] ?? null,
+                        'granted_permissions' => $sessionData['granted_scopes'] ?? [],
                     ],
                 ]
             );
 
-            Log::info('Messenger OAuth: permissions granted', [
-                'page_id' => $page['id'],
-                'granted_scopes' => $request->input('granted_scopes'),
-            ]);
-
-            // Debug: Check token permissions
-            $debugResponse = Http::get("https://graph.facebook.com/v18.0/debug_token", [
-                'input_token' => $page['access_token'],
-                'access_token' => setting('INSTAGRAM_APP_ID') . '|' . setting('INSTAGRAM_APP_SECRET'),
-            ]);
-
-            Log::info('Messenger OAuth: token debug', [
-                'page_id' => $page['id'],
-                'debug_response' => $debugResponse->json(),
-            ]);
-
-            // Also update legacy SocialMediaPlatform with the new token
+            // Also update legacy SocialMediaPlatform if exists
             $legacyPlatform = \App\Extensions\SocialMedia\System\Models\SocialMediaPlatform::where('platform', 'facebook')
                 ->whereJsonContains('credentials->platform_id', $page['id'])
                 ->first();
@@ -136,46 +270,42 @@ class MessengerOAuthController extends Controller
                 $credentials['access_token'] = $page['access_token'];
                 $legacyPlatform->credentials = $credentials;
                 $legacyPlatform->save();
-
-                Log::info('Messenger OAuth: Updated legacy platform credentials', [
-                    'page_id' => $page['id'],
-                    'platform_id' => $legacyPlatform->id,
-                ]);
             }
 
-            // Subscribe the Page to our App's webhooks so Facebook starts
-            // delivering feed (comments) and messages events to our webhook URL.
-            // Without this call the App-level webhook URL is registered but
-            // Facebook never sends real events for this Page.
-            $subscribeRes = Http::withToken($page['access_token'])
-                ->post("https://graph.facebook.com/v18.0/{$page['id']}/subscribed_apps", [
-                    'subscribed_fields' => 'feed,messages,messaging_postbacks,messaging_optins',
-                ]);
+            // Subscribe the Page to our App's webhooks
+            try {
+                $subscribeRes = Http::withToken($page['access_token'])
+                    ->post("https://graph.facebook.com/v18.0/{$page['id']}/subscribed_apps", [
+                        'subscribed_fields' => 'feed,messages,messaging_postbacks,messaging_optins',
+                    ]);
 
-            if ($subscribeRes->successful()) {
-                Log::info('Messenger OAuth: page subscribed to app webhooks', [
-                    'page_id'   => $page['id'],
-                    'page_name' => $page['name'],
-                    'result'    => $subscribeRes->json(),
-                ]);
-            } else {
-                Log::warning('Messenger OAuth: page webhook subscription failed (non-fatal)', [
-                    'page_id'   => $page['id'],
-                    'page_name' => $page['name'],
-                    'status'    => $subscribeRes->status(),
-                    'body'      => $subscribeRes->json(),
-                ]);
+                if ($subscribeRes->successful()) {
+                    Log::info('Messenger OAuth: page subscribed to app webhooks', [
+                        'page_id'   => $page['id'],
+                        'page_name' => $page['name'],
+                    ]);
+                } else {
+                    Log::warning('Messenger OAuth: webhook subscription returned non-success', [
+                        'page_id'   => $page['id'],
+                        'page_name' => $page['name'],
+                        'status'    => $subscribeRes->status(),
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Messenger OAuth: webhook subscription error for page ' . $page['id'] . ': ' . $e->getMessage());
             }
 
-            return redirect()->route('dashboard.user.integrations.index')
-                ->with(['type' => 'success', 'message' => trans('Facebook Page connected successfully.')]);
-
-        } catch (Exception $e) {
-            Log::error('Messenger OAuth callback failed', ['user_id' => $user->id, 'error' => $e->getMessage()]);
-
-            return redirect()->route('dashboard.user.integrations.index')
-                ->with(['type' => 'error', 'message' => trans('Failed to connect Facebook Page. Please try again.')]);
+            $connectedCount++;
         }
+
+        Cache::forget("messenger_pick_{$pickToken}");
+
+        $message = $connectedCount === 1
+            ? trans('Facebook Page connected successfully.')
+            : trans(':count Facebook Pages connected successfully.', ['count' => $connectedCount]);
+
+        return redirect()->route('dashboard.user.integrations.index')
+            ->with(['type' => 'success', 'message' => $message]);
     }
 
     private function redirectUri(): string
@@ -186,13 +316,12 @@ class MessengerOAuthController extends Controller
     /**
      * One-time fix: subscribe all existing connected Messenger pages to the App's webhooks.
      * Visit: GET /dashboard/user/integrations/messenger/resubscribe
-     * This is needed for pages connected before the subscription call was added to callback().
      */
     public function resubscribeAll()
     {
         $user = Auth::user();
 
-        $accounts = \App\Models\ConnectedAccount::query()
+        $accounts = ConnectedAccount::query()
             ->where('user_id', $user->id)
             ->where('platform', 'messenger')
             ->where('connection_status', 'connected')

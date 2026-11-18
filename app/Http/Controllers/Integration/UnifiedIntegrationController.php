@@ -107,6 +107,36 @@ class UnifiedIntegrationController extends Controller
             }
         }
 
+        // 4. Check Salla integration status
+        if (class_exists(\App\Models\SallaConnection::class)) {
+            $sallaConnections = \App\Models\SallaConnection::query()
+                ->where('user_id', $user->id)
+                ->where('connection_status', 'connected')
+                ->get();
+
+            foreach ($sallaConnections as $sallaConn) {
+                if (! $connectedAccounts->has('salla') || $connectedAccounts->get('salla')->isEmpty()) {
+                    $sallaAccount = new ConnectedAccount([
+                        'id'                 => $sallaConn->id,
+                        'user_id'            => $sallaConn->user_id,
+                        'platform'           => 'salla',
+                        'account_identifier' => (string) ($sallaConn->salla_store_id ?? $sallaConn->id),
+                        'account_name'       => $sallaConn->store_name ?: 'Salla Store',
+                        'account_username'   => $sallaConn->store_domain,
+                        'account_avatar'     => null,
+                        'connection_status'  => 'connected',
+                        'connected_at'       => $sallaConn->connected_at ?? $sallaConn->created_at,
+                    ]);
+
+                    if (! $connectedAccounts->has('salla')) {
+                        $connectedAccounts->put('salla', collect([$sallaAccount]));
+                    } else {
+                        $connectedAccounts->get('salla')->push($sallaAccount);
+                    }
+                }
+            }
+        }
+
         // Define supported platforms and their OAuth / connect routes
         $platforms = $this->getSupportedPlatforms();
 
@@ -265,6 +295,24 @@ class UnifiedIntegrationController extends Controller
                 'enabled'      => true,
                 'description'  => 'Connect YouTube Shorts for quick short-form video publishing.',
             ],
+            'whatsapp_cloud' => [
+                'name'         => 'WhatsApp Business',
+                'icon'         => 'whatsapp.svg',
+                'connect_route' => 'dashboard.user.integrations.whatsapp-cloud.connect',
+                'connect_url'  => \Route::has('dashboard.user.integrations.whatsapp-cloud.connect') ? route('dashboard.user.integrations.whatsapp-cloud.connect') : '#',
+                'oauth'        => true,
+                'enabled'      => true,
+                'description'  => 'Connect official WhatsApp Business Cloud API in 1-click for AI customer support and automated messaging.',
+            ],
+            'messenger' => [
+                'name'         => 'Facebook Messenger',
+                'icon'         => 'facebook-messenger.svg',
+                'connect_route' => 'dashboard.user.integrations.messenger.connect',
+                'connect_url'  => \Route::has('dashboard.user.integrations.messenger.connect') ? route('dashboard.user.integrations.messenger.connect') : '#',
+                'oauth'        => true,
+                'enabled'      => true,
+                'description'  => 'Connect your Facebook Pages to automate Messenger replies, post comments, and 24/7 AI customer care.',
+            ],
             'woocommerce' => [
                 'name'         => 'WooCommerce',
                 'icon'         => 'woocommerce.svg',
@@ -272,9 +320,26 @@ class UnifiedIntegrationController extends Controller
                 'connect_url'  => \Route::has('dashboard.user.integration.index') ? route('dashboard.user.integration.index') : '#',
                 'oauth'        => false,
                 'enabled'      => true,
-                'description'  => 'Integrate your WooCommerce store for automated product publishing and e-commerce AI tools.',
+                'description'  => 'Integrate your WooCommerce store for automated product queries, orders, and AI shopping.',
+            ],
+            'salla' => [
+                'name'         => 'Salla (سلة)',
+                'icon'         => 'salla.svg',
+                'connect_route' => 'dashboard.user.salla.connect',
+                'connect_url'  => \Route::has('dashboard.user.salla.connect') ? route('dashboard.user.salla.connect') : '#',
+                'oauth'        => true,
+                'enabled'      => true,
+                'description'  => 'Connect your Salla store via official OAuth to sync products, inventory, and real-time order tracking.',
+            ],
+            'shopify' => [
+                'name'         => 'Shopify',
+                'icon'         => 'shopify.svg',
+                'connect_route' => 'dashboard.user.chatbots.index',
+                'connect_url'  => \Route::has('dashboard.user.chatbots.index') ? route('dashboard.user.chatbots.index') : '#',
+                'oauth'        => false,
+                'enabled'      => true,
+                'description'  => 'Connect your Shopify store via Storefront/Admin API to enable product search, prices, and cart checkout.',
             ],
         ];
     }
-}
 }

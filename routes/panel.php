@@ -171,6 +171,10 @@ Route::middleware(['auth', 'updateUserActivity'])
                             ->name('connect');
                         Route::get('callback', [\App\Http\Controllers\Integration\InstagramOAuthController::class, 'callback'])
                             ->name('callback');
+                        Route::get('select', [\App\Http\Controllers\Integration\InstagramOAuthController::class, 'select'])
+                            ->name('select');
+                        Route::post('store', [\App\Http\Controllers\Integration\InstagramOAuthController::class, 'store'])
+                            ->name('store');
                     });
 
                     // Messenger OAuth
@@ -179,6 +183,10 @@ Route::middleware(['auth', 'updateUserActivity'])
                             ->name('connect');
                         Route::get('callback', [\App\Http\Controllers\Integration\MessengerOAuthController::class, 'callback'])
                             ->name('callback');
+                        Route::get('select', [\App\Http\Controllers\Integration\MessengerOAuthController::class, 'select'])
+                            ->name('select');
+                        Route::post('store', [\App\Http\Controllers\Integration\MessengerOAuthController::class, 'store'])
+                            ->name('store');
                         // One-time fix: subscribe existing connected pages to app webhooks
                         Route::get('resubscribe', [\App\Http\Controllers\Integration\MessengerOAuthController::class, 'resubscribeAll'])
                             ->name('resubscribe');
@@ -190,6 +198,10 @@ Route::middleware(['auth', 'updateUserActivity'])
                             ->name('connect');
                         Route::get('callback', [\App\Http\Controllers\Integration\WhatsAppCloudOAuthController::class, 'callback'])
                             ->name('callback');
+                        Route::post('complete', [\App\Http\Controllers\Integration\WhatsAppCloudOAuthController::class, 'complete'])
+                            ->name('complete');
+                        Route::post('direct-connect', [\App\Http\Controllers\Integration\WhatsAppCloudOAuthController::class, 'directConnect'])
+                            ->name('direct-connect');
                     });
                 });
 

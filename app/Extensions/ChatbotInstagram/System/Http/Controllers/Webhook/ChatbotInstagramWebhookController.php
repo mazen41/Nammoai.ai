@@ -102,11 +102,16 @@ class ChatbotInstagramWebhookController extends Controller
     }
 
     /**
-     * Verify GET subscription using global verify token from settings.
+     * Verify GET subscription using global verify token from settings or environment.
      */
     protected function verifySubscription(Request $request): Response
     {
-        $verifyToken = setting('INSTAGRAM_VERIFY_TOKEN');
+        $verifyToken = env('INSTAGRAM_WEBHOOK_VERIFY_TOKEN')
+            ?: setting('INSTAGRAM_VERIFY_TOKEN')
+            ?: setting('INSTAGRAM_WEBHOOK_VERIFY_TOKEN')
+            ?: setting('INSTAGRAM_WEBHOOK_SECRET')
+            ?: env('INSTAGRAM_VERIFY_TOKEN')
+            ?: env('MESSENGER_WEBHOOK_VERIFY_TOKEN');
 
         if ($request->get('hub_mode') === 'subscribe' && $request->get('hub_verify_token') === $verifyToken) {
             return response($request->get('hub_challenge'), 200);
@@ -121,7 +126,12 @@ class ChatbotInstagramWebhookController extends Controller
      */
     protected function verifySignature(Request $request): bool
     {
-        $appSecret = setting('INSTAGRAM_APP_SECRET');
+        $appSecret = env('INSTAGRAM_WEBHOOK_SECRET')
+            ?: setting('INSTAGRAM_APP_SECRET')
+            ?: setting('INSTAGRAM_WEBHOOK_SECRET')
+            ?: env('INSTAGRAM_APP_SECRET')
+            ?: setting('FACEBOOK_APP_SECRET')
+            ?: env('FACEBOOK_APP_SECRET');
 
         if (! $appSecret) {
             Log::error('Instagram webhook rejected: INSTAGRAM_APP_SECRET not configured');
